@@ -1,4 +1,5 @@
 from MEGABYTE_pytorch import MEGABYTE
+import bitsandbytes as bnb
 
 import random
 import tqdm
@@ -8,11 +9,12 @@ import torch
 import torch.optim as optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
+from bitsandbytes.optim.adam import Adam8bit
 
 # constants
 
-NUM_BATCHES = int(1e5)
-BATCH_SIZE = 4
+NUM_BATCHES = int(66666)
+BATCH_SIZE = 6
 GRADIENT_ACCUMULATE_EVERY = 4
 LEARNING_RATE = 2e-4
 VALIDATE_EVERY  = 100
@@ -35,13 +37,15 @@ def decode_tokens(tokens):
 
 # instantiate GPT-like decoder model
 
+# global: D: 1024, L: 14
+# local: D: 1024, L: 18
 model = MEGABYTE(
     num_tokens = 256,
-    dim = (768, 512, 256),
-    depth = (6, 4, 2),
-    max_seq_len = (512, 4, 4),
+    dim = (96, 64),  # embeddings dimenstion -> 
+    max_seq_len = (2048, 1024),  # number of embeddings -> d_model
+    depth = (14, 18),  # numof layers => #L
     flash_attn = True
-).cuda()
+).to(dtype=torch.bfloat16).cuda()
 
 # prepare enwik8 data
 
@@ -71,7 +75,8 @@ val_loader    = cycle(DataLoader(val_dataset, batch_size = BATCH_SIZE))
 
 # optimizer
 
-optim = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+# optim = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+optim = Adam8bit(model.parameters(), lr=LEARNING_RATE)
 
 # training
 
