@@ -12,11 +12,11 @@ from torch.utils.data import DataLoader, Dataset
 from bitsandbytes.optim.adam import Adam8bit
 
 # constants
-
-NUM_BATCHES = int(66666)
-BATCH_SIZE = 6
-GRADIENT_ACCUMULATE_EVERY = 4
-LEARNING_RATE = 2e-4
+TOTAL_BATCHES = 1600000
+BATCH_SIZE = 8
+GRADIENT_ACCUMULATE_EVERY = 8
+NUM_BATCHES = TOTAL_BATCHES // BATCH_SIZE // GRADIENT_ACCUMULATE_EVERY
+LEARNING_RATE = 4e-4
 VALIDATE_EVERY  = 100
 GENERATE_EVERY  = 500
 PRIME_LEN = 100
@@ -80,14 +80,15 @@ optim = Adam8bit(model.parameters(), lr=LEARNING_RATE)
 
 # training
 
-for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
+pbar = tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training')
+for i in pbar:
     model.train()
 
     for __ in range(GRADIENT_ACCUMULATE_EVERY):
         loss = model(next(train_loader), return_loss = True)
         loss.backward()
 
-    print(f'training loss: {loss.item()}')
+    pbar.set_description(f'training loss: {loss.item()}')
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     optim.step()
     optim.zero_grad()
@@ -96,7 +97,7 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
         model.eval()
         with torch.no_grad():
             loss = model(next(val_loader), return_loss = True)
-            print(f'validation loss: {loss.item()}')
+            pbar.set_description(f'validation loss: {loss.item()}')
 
     if i != 0 and i % GENERATE_EVERY == 0:
         model.eval()
