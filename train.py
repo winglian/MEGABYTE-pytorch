@@ -2,6 +2,7 @@ from MEGABYTE_pytorch import MEGABYTE
 import bitsandbytes as bnb
 
 import random
+import signal
 import tqdm
 import gzip
 import numpy as np
@@ -17,8 +18,8 @@ BATCH_SIZE = 8
 GRADIENT_ACCUMULATE_EVERY = 8
 NUM_BATCHES = TOTAL_BATCHES // BATCH_SIZE // GRADIENT_ACCUMULATE_EVERY
 LEARNING_RATE = 4e-4
-VALIDATE_EVERY  = 100
-GENERATE_EVERY  = 500
+VALIDATE_EVERY  = 1600 // BATCH_SIZE // GRADIENT_ACCUMULATE_EVERY
+GENERATE_EVERY  = 8000 // BATCH_SIZE // GRADIENT_ACCUMULATE_EVERY
 PRIME_LEN = 100
 SEQ_LEN = 8192
 
@@ -80,6 +81,11 @@ optim = Adam8bit(model.parameters(), lr=LEARNING_RATE)
 
 # training
 
+signal.signal(
+    signal.SIGINT,
+    lambda signal, frame: (torch.save(model.state_dict(), 'path_to_save_your_model.pt'), exit(0)),
+)
+
 pbar = tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training')
 for i in pbar:
     model.train()
@@ -98,6 +104,7 @@ for i in pbar:
         with torch.no_grad():
             loss = model(next(val_loader), return_loss = True)
             pbar.set_description(f'validation loss: {loss.item()}')
+        torch.save(model.state_dict(), 'path_to_save_your_model.pt')
 
     if i != 0 and i % GENERATE_EVERY == 0:
         model.eval()
@@ -111,3 +118,4 @@ for i in pbar:
 
         output_str = decode_tokens(sample[0][PRIME_LEN:])
         print(output_str)
+torch.save(model.state_dict(), 'path_to_save_your_model.pt')
