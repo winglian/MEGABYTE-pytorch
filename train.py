@@ -19,7 +19,7 @@ from sophiag import SophiaG
 # constants
 TOTAL_BATCHES = 15000000 # approximately 15M btaches of 8192 for 1 epoch of wikipedia
 BATCH_SIZE = 12
-GRADIENT_ACCUMULATE_EVERY = 16
+GRADIENT_ACCUMULATE_EVERY = 128
 NUM_BATCHES = TOTAL_BATCHES // BATCH_SIZE // GRADIENT_ACCUMULATE_EVERY
 LEARNING_RATE = 4e-4
 VALIDATE_EVERY  = 1600 // BATCH_SIZE // GRADIENT_ACCUMULATE_EVERY
@@ -64,7 +64,7 @@ class WrappedDataset(IterableDataset):
         while True:  # Infinite loop over the dataset
             for row in self.huggingface_dataset:
                 formatted_text = f"=={row['title']}==\n{row['text']}"
-                x = np.frombuffer(formatted_text.encode(), dtype=np.uint8)
+                x = np.frombuffer(formatted_text.encode(), dtype=np.uint8).copy()
                 buffer = torch.cat((buffer, torch.from_numpy(x)), dim=0)
                 while len(buffer) >= self.seq_len:
                     yield buffer[:self.seq_len].long()
@@ -73,7 +73,10 @@ class WrappedDataset(IterableDataset):
 def main():
     wandb.login()
 
-    accelerator = Accelerator(log_with="wandb")
+    accelerator = Accelerator(
+        log_with="wandb",
+        # gradient_accumulation_steps=GRADIENT_ACCUMULATE_EVERY,  # TODO
+    )
     accelerator.init_trackers(
         project_name="smb-wikipedia",
         config={"learning_rate": LEARNING_RATE},
