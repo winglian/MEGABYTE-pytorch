@@ -8,6 +8,7 @@ import tqdm
 import gzip
 import numpy as np
 import torch
+import wandb
 import torch.optim as optim
 from datasets import load_dataset
 from torch.nn import functional as F
@@ -17,12 +18,13 @@ from sophiag import SophiaG
 
 # constants
 TOTAL_BATCHES = 15000000 # approximately 15M btaches of 8192 for 1 epoch of wikipedia
-BATCH_SIZE = 4
-GRADIENT_ACCUMULATE_EVERY = 8
+BATCH_SIZE = 12
+GRADIENT_ACCUMULATE_EVERY = 16
 NUM_BATCHES = TOTAL_BATCHES // BATCH_SIZE // GRADIENT_ACCUMULATE_EVERY
 LEARNING_RATE = 4e-4
 VALIDATE_EVERY  = 1600 // BATCH_SIZE // GRADIENT_ACCUMULATE_EVERY
 GENERATE_EVERY  = 8000 // BATCH_SIZE // GRADIENT_ACCUMULATE_EVERY
+CHECKPOINT_EVERY  = 3200 // BATCH_SIZE // GRADIENT_ACCUMULATE_EVERY
 PRIME_LEN = 100
 SEQ_LEN = 8192
 
@@ -69,7 +71,13 @@ class WrappedDataset(IterableDataset):
                     buffer = buffer[self.seq_len:]
 
 def main():
-    accelerator = Accelerator()
+    wandb.login()
+
+    accelerator = Accelerator(log_with="wandb")
+    accelerator.init_trackers(
+        project_name="smb-wikipedia",
+        config={"learning_rate": LEARNING_RATE},
+    )
 
     wikipedia_ds = load_dataset("lsb/enwiki20230101")
 
@@ -87,8 +95,10 @@ def main():
     model = MEGABYTE(
         num_tokens = 8192,
         dim = 512,
-        depth = (6, 4),
+        depth = (24, 12),
         max_seq_len = (2048, 1024),
+        dim_head = 64,
+        heads=16,
         flash_attn = flash_attn
     ).to(accelerator.device, dtype=torch.bfloat16)
     # model = MEGABYTE(
@@ -133,11 +143,11 @@ def main():
         model.train()
 
         for __ in range(GRADIENT_ACCUMULATE_EVERY):
-            loss = model(next(train_loader), return_loss = True)
-            accelerator.backward(loss)
+            train_loss = model(next(train_loader), return_loss = True)
+            accelerator.backward(train_loss)
             # loss.backward()
 
-        pbar.set_description(f'training loss: {loss.item()}')
+        pbar.set_description(f'training loss: {train_loss.item()}')
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
         optimizer.step()
         optimizer.zero_grad()
@@ -147,7 +157,13 @@ def main():
             with torch.no_grad():
                 loss = model(next(val_loader), return_loss = True)
                 pbar.set_description(f'validation loss: {loss.item()}')
+                accelerator.log({"train_loss": train_loss.item(), "valid_loss": loss.item()})
             torch.save(model.state_dict(), 'path_to_save_your_model.pt')
+        else:
+            accelerator.log({"train_loss": train_loss.item()})
+
+        if i % CHECKPOINT_EVERY == 0:
+            torch.save(model.state_dict(), f"model_out.chkpt_{i}pt")
 
     torch.save(model.state_dict(), 'model_out.pt')
 
