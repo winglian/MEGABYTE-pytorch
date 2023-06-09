@@ -202,224 +202,134 @@ class Transformer(nn.Module):
 
 # main class
 
-class MEGABYTE(nn.Module):
 
+def count_trainable_params(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+class MEGABYTE(nn.Module):
     @beartype
     def __init__(
         self,
         *,
-        num_tokens,
-        dim: Union[Tuple, int],
-        depth: Tuple,
-        max_seq_len: Tuple,
-        dim_head = 64,
-        heads = 8,
-        attn_dropout = 0.,
-        ff_mult = 4,
-        ff_dropout = 0.,
-        pad_id = 0,
-        rel_pos_bias = True,
-        flash_attn = False
+        global_hidden_size,  # D_G
+        global_num_hidden_layers,
+        global_num_attention_heads,
+        local_hidden_size,  # D_L
+        local_num_hidden_layers,
+        local_num_attention_heads,
+        vocab_size=256,  # V
+        max_position_embedding=8192,  # T
+        patch_size=8,  # P
+        attn_dropout=0.0,
+        ff_mult=4,
+        ff_dropout=0.0,
+        pad_id=0,
+        rel_pos_bias=True,
+        flash_attn=False,
     ):
         super().__init__()
 
-        # simplified configuration for each stage of the hierarchy
-        # depth = (2, 2, 4) would translate to depth 2 at first stage, depth 2 second stage, depth 4 third
-        # max_seq_len = (16, 8, 4) would translate to max sequence length of 16 at first stage, length of 8 at second stage, length of 4 for last
+        self.patch_size = patch_size
+        self.pad = pad_id
+        self.max_position_embedding = max_position_embedding
 
-        assert isinstance(depth, tuple) and isinstance(max_seq_len, tuple)
-        assert len(depth) == len(max_seq_len)
+        self.pos_emb = nn.Embedding(max_position_embedding, global_hidden_size)
+        self.global_emb = nn.Embedding(vocab_size, global_hidden_size)
+        self.local_emb = nn.Embedding(vocab_size, local_hidden_size)
 
-        self.stages = len(depth)
-        dim = cast_tuple(dim, self.stages)
+        self.global_to_local = nn.Linear(global_hidden_size, local_hidden_size)
+        self.local_to_logits = nn.Linear(local_hidden_size, vocab_size)
 
-        assert len(dim) == self.stages
+        self.global_transformer = Transformer(
+            dim=patch_size * global_hidden_size,
+            layers=global_num_hidden_layers,
+            dim_head=(patch_size * global_hidden_size) // global_num_attention_heads,
+            heads=global_num_attention_heads,
+            attn_dropout=attn_dropout,
+            ff_dropout=ff_dropout,
+            ff_mult=ff_mult,
+            rel_pos_bias=rel_pos_bias,
+            flash_attn=flash_attn,
+        )
+        self.local_transformer = Transformer(
+            dim=local_hidden_size,
+            layers=local_num_hidden_layers,
+            dim_head=local_hidden_size // local_num_attention_heads,
+            heads=local_num_attention_heads,
+            attn_dropout=attn_dropout,
+            ff_dropout=ff_dropout,
+            ff_mult=ff_mult,
+            rel_pos_bias=rel_pos_bias,
+            flash_attn=flash_attn,
+        )
 
-        coarsest_dim, *_, fine_dim = dim
+        print(f"Params global: {count_trainable_params(self.global_transformer):,}")
+        print(f"Params local : {count_trainable_params(self.local_transformer):,}")
 
-        self.token_emb = nn.Embedding(num_tokens, fine_dim)
-
-        self.max_seq_len = max_seq_len
-
-        self.start_tokens = nn.ParameterList([nn.Parameter(torch.randn(h_dim)) for h_dim, seq_len in zip(dim, max_seq_len)])
-        self.pos_embs = nn.ModuleList([nn.Embedding(seq_len, h_dim) for h_dim, seq_len in zip(dim, max_seq_len)])
-
-        self.patch_embedders = nn.ModuleList([nn.Sequential(
-            Rearrange('... r d -> ... (r d)'),
-            nn.LayerNorm(seq_len * dim_in),
-            nn.Linear(seq_len * dim_in, dim_out),
-            nn.LayerNorm(dim_out)
-        ) for dim_in, dim_out, seq_len in zip(dim[1:], dim[:-1], max_seq_len[1:])])
-
-        self.transformers = nn.ModuleList([])
-        self.to_next_transformer_projections = nn.ModuleList([])
-
-        for h_dim, next_h_dim, stage_depth, next_seq_len in zip_longest(dim, dim[1:], depth, max_seq_len[1:]):
-            self.transformers.append(Transformer(
-                dim = h_dim,
-                layers = stage_depth,
-                dim_head = dim_head,
-                heads = heads,
-                attn_dropout = attn_dropout,
-                ff_dropout = ff_dropout,
-                ff_mult = ff_mult,
-                rel_pos_bias = rel_pos_bias,
-                flash_attn = flash_attn
-            ))
-
-            proj = nn.Identity()
-
-            if exists(next_h_dim) and next_h_dim != dim:
-                proj = nn.Sequential(
-                    nn.Linear(h_dim, next_h_dim * next_seq_len),
-                    Rearrange('... (n d) -> (...) n d', n = next_seq_len)
-                )
-
-            self.to_next_transformer_projections.append(proj)
-
-        self.to_logits = nn.Linear(fine_dim, num_tokens)
-        self.pad_id = pad_id
-
-    def generate(self, prime = None, filter_thres = 0.9, temperature = 1., default_batch_size = 1):
-        total_seq_len = reduce_mult(self.max_seq_len)
+    def generate(
+        self, prime=None, filter_thres=0.9, temperature=1.0, default_batch_size=1
+    ):
+        total_seq_len = self.max_position_embedding
         device = next(self.parameters()).device
 
         if not exists(prime):
-            prime = torch.empty((default_batch_size, 0), dtype = torch.long, device = device)
-
+            prime = torch.empty(
+                (default_batch_size, 0), dtype=torch.long, device=device
+            )
         seq = prime
-        batch = seq.shape[0]
 
         for _ in tqdm(range(total_seq_len - seq.shape[-1])):
-            logits = self.forward(seq)[:, -1]
-            logits = top_k(logits, thres = filter_thres)
-            sampled = gumbel_sample(logits, dim = -1, temperature = temperature)
-            seq = torch.cat((seq, rearrange(sampled, 'b -> b 1')), dim = -1)
+            seq_in = F.pad(seq, (0, 1), value=self.pad)
+            logits = self.forward(seq_in)[:, -1]
+            logits = top_k(logits, thres=filter_thres)
+            sampled = gumbel_sample(logits, dim=-1, temperature=temperature)
+            seq = torch.cat((seq, rearrange(sampled, "b -> b 1")), dim=-1)
 
-        return seq.reshape(batch, *self.max_seq_len)
+        return seq
 
-    def forward_empty(self, batch_size):
-        # take care of special case
-        # where you sample from input of 0 (start token only)
+    def prepare_input(self, bytes):
+        padding_global = bytes.new(bytes.shape[0], self.patch_size).fill_(self.pad)
+        bytes_global = torch.cat((padding_global, bytes[:, : -self.patch_size]), -1)
+        bytes_input = rearrange(bytes, "b (t p) -> (b t) p", p=self.patch_size)
+        padding_local = bytes_input.new(bytes_input.shape[0], 1).fill_(self.pad)
+        bytes_local = torch.cat((padding_local, bytes_input[:, :-1]), -1)
+        return bytes_global, bytes_local
 
-        prev_stage_tokens_repr = None
+    def forward(self, bytes, return_loss=False):
+        device = bytes.device
+        batch_size, seq_len = bytes.shape
 
-        for stage_start_tokens, transformer, proj in zip(self.start_tokens, self.transformers, self.to_next_transformer_projections):
-            tokens = repeat(stage_start_tokens, 'd -> b 1 d', b = batch_size)
+        padlen = remainder_to_mult(seq_len, self.patch_size)
+        bytes_padded = F.pad(bytes, (0, padlen), value=self.pad)
+        bytes_global, bytes_local = self.prepare_input(bytes_padded)
 
-            if exists(prev_stage_tokens_repr):
-                tokens = tokens + prev_stage_tokens_repr[..., :tokens.shape[-2], :]
-
-            tokens = transformer(tokens)
-            prev_stage_tokens_repr = proj(tokens)
-
-        return self.to_logits(tokens)
-
-    def forward(self, ids, return_loss = False):
-        batch = ids.shape[0]
-
-        assert ids.ndim in {2, self.stages + 1}
-        flattened_dims = ids.ndim == 2
-        ids_orig_ndim = ids.ndim
-
-        if ids.numel() == 0:
-            return self.forward_empty(ids.shape[0])
-
-        if flattened_dims:
-            # allow for ids to be given in the shape of (batch, seq)
-            # in which case it will be auto-padded to the next nearest multiple of depth seq len
-            seq_len = ids.shape[-1]
-            multiple_of = reduce_mult(self.max_seq_len[1:])
-            padding = remainder_to_mult(seq_len, multiple_of)
-            ids = F.pad(ids, (0, padding), value = self.pad_id)
-            ids = ids.reshape(batch, -1, *self.max_seq_len[1:])
-
-        b, *prec_dims, device = *ids.shape, ids.device
-
-        # check some dimensions
-
-        assert prec_dims[0] <= self.max_seq_len[0], 'the first dimension of your axial autoregressive transformer must be less than the first tuple element of max_seq_len (like any autoregressive transformer)'
-        assert tuple(prec_dims[1:]) == tuple(self.max_seq_len[1:]), 'all subsequent dimensions must match exactly'
-
-        # get token embeddings
-
-        tokens = self.token_emb(ids)
-
-        # get tokens for all hierarchical stages, reducing by appropriate dimensions
-        # and adding the absolute positional embeddings
-
-        tokens_at_stages = []
-        reduced_tokens = tokens
-
-        for ind, pos_emb, patch_emb in zip(range(len(prec_dims)), reversed(self.pos_embs), reversed((*self.patch_embedders, None))):
-            is_first = ind == 0
-
-            if not is_first:
-                reduced_tokens = patch_emb(reduced_tokens)
-
-            positions = pos_emb(torch.arange(reduced_tokens.shape[-2], device = device))
-            tokens_with_position = reduced_tokens + positions
-            tokens_at_stages.insert(0, tokens_with_position)
-
-        # the un-pixelshuffled representations of the previous hierarchy, starts with None
-
-        prev_stage_tokens_repr = None
-
-        # spatial tokens is tokens with depth pos reduced along depth dimension + spatial positions
-
-        for stage_start_tokens, stage_tokens, transformer, proj in zip(self.start_tokens, tokens_at_stages, self.transformers, self.to_next_transformer_projections):
-            stage_tokens, ps = pack_one(stage_tokens, '* n d')
-
-            stage_start_tokens = repeat(stage_start_tokens, 'f -> b 1 f', b = stage_tokens.shape[0])
-
-            # concat start token
-
-            stage_tokens = torch.cat((
-                stage_start_tokens,
-                stage_tokens,
-            ), dim = -2)
-
-            # sum the previous hierarchy's representation
-
-            if exists(prev_stage_tokens_repr):
-                prev_stage_tokens_repr = F.pad(prev_stage_tokens_repr, (0, 0, 1, 0), value = 0.)
-                stage_tokens = stage_tokens + prev_stage_tokens_repr
-
-            attended = transformer(stage_tokens)
-
-            attended = unpack_one(attended, ps, '* n d')
-
-            # project for next stage in the hierarchy
-
-            prev_stage_tokens_repr = proj(attended[..., :-1, :])
-
-        # project to logits
-
-        logits = self.to_logits(attended)
-
-        start_tokens = logits[(slice(None), *((0,) * (logits.ndim - 2)), slice(None))]
-        start_tokens = rearrange(start_tokens, 'b d -> b 1 d')
-
-        logits = logits[..., 1:, :]
-
-        if not return_loss:
-
-            if flattened_dims:
-                logits = rearrange(logits, 'b ... c -> b (...) c')
-                logits = logits[:, :seq_len]
-
-            return logits
-
-        logits = rearrange(logits, 'b ... c -> b (...) c')
-        logits = torch.cat((start_tokens, logits), dim = -2)
-
-        preds = rearrange(logits, 'b n c -> b c n')
-        labels = rearrange(ids, 'b ... -> b (...)')
-
-        loss = F.cross_entropy(
-            preds[..., :-1],
-            labels,
-            ignore_index = self.pad_id
+        global_bytes_embedded = self.global_emb(bytes_global)
+        global_bytes_embedded += self.pos_emb(
+            torch.arange(global_bytes_embedded.shape[1], device=device)
+        )
+        global_in = rearrange(
+            global_bytes_embedded,
+            "b (t p) e -> b t (p e)",
+            p=self.patch_size,
+        )
+        global_out = self.global_transformer(global_in)
+        global_out_reshaped = rearrange(
+            global_out,
+            "b t (p e) -> (b t) p e",
+            p=self.patch_size,
         )
 
+        local_in = self.global_to_local(global_out_reshaped)
+        local_in += self.local_emb(bytes_local)
+        local_out = self.local_transformer(local_in)
+        local_out = rearrange(local_out, "(b t) l v -> b (t l) v", b=batch_size)
+
+        logits = self.local_to_logits(local_out)
+        logits = logits[:, :seq_len]
+        if not return_loss:
+            return logits
+
+        logits = rearrange(logits, "b n c -> b c n")
+        loss = F.cross_entropy(logits, bytes, ignore_index=self.pad)
         return loss

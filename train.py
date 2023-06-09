@@ -147,13 +147,13 @@ def build_model():
     torch.backends.cuda.matmul.allow_tf32 = True
 
     return MEGABYTE(
-        num_tokens = 256,
-        dim = 384,  # embeddings dimenstion -> d_head
-        depth = (24, 12),  # numof layers => #L
-        max_seq_len = (1024, 768),  # number of embeddings -> d_model
-        dim_head = 64,
-        heads=16,
-        flash_attn = flash_attn
+        global_hidden_size=384 // 8,
+        global_num_hidden_layers=24,
+        global_num_attention_heads=16,
+        local_hidden_size=384,
+        local_num_hidden_layers=12,
+        local_num_attention_heads=16,
+        flash_attn=flash_attn,
     )
 
 
@@ -222,6 +222,7 @@ def main(auto_resume=False):
         config={"learning_rate": LEARNING_RATE},
     )
 
+    print("Device:", accelerator.device)
     model.to(accelerator.device, dtype=torch.bfloat16)
 
     # training
@@ -261,7 +262,7 @@ def main(auto_resume=False):
         model.train()
 
         with accelerator.accumulate(model):
-            train_loss = model(next(train_loader), return_loss = True)
+            train_loss = model(next(train_loader).to(device), return_loss = True)
             accelerator.backward(train_loss)
 
             train_loss_str = train_loss.item()
@@ -277,7 +278,7 @@ def main(auto_resume=False):
         if validate_every and i % validate_every == 0:
             model.eval()
             with torch.no_grad():
-                loss = model(next(val_loader), return_loss = True)
+                loss = model(next(val_loader).to(device), return_loss = True)
                 val_loss_str = loss.item()
                 pbar.set_description(f'reserved_gb: {reserved_gb}, training loss: {train_loss_str}, validation loss: {val_loss_str}')
                 accelerator.log({"train_loss": train_loss.item(), "valid_loss": loss.item()})
